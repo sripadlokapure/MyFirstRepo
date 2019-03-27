@@ -1,3 +1,9 @@
-# MyFirstRepo
-MyFirstRepo
-Welcome to MyFirst Repo
+# SFDX App
+
+## Dev, Build and Test
+
+## Resources
+
+## Description of Files and Directories
+
+## Issues
