@@ -1,0 +1,147 @@
+// Tiny JSON-file store. Good enough for one person's task list; swap for
+// SQLite/Postgres if you ever need multi-user or heavy traffic.
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+
+export const TASK_STATUSES = [
+  "todo", // manual task, nobody has asked the agent to do anything
+  "planning", // agent is drafting activities from the instructions
+  "pending_approval", // plan is ready, waiting for you to approve
+  "queued", // approved, waiting for the runner to pick it up
+  "running", // agent is working on it
+  "waiting_on_you", // blocked on a question, a human activity, or a step approval
+  "done",
+  "failed",
+  "cancelled",
+];
+
+export const ACTIVITY_STATUSES = ["todo", "in_progress", "waiting_on_you", "done", "skipped", "failed"];
+
+export const newId = () => crypto.randomUUID();
+const now = () => new Date().toISOString();
+
+export class Store {
+  constructor(dataDir) {
+    this.dataDir = dataDir;
+    this.file = path.join(dataDir, "db.json");
+    fs.mkdirSync(dataDir, { recursive: true });
+    this.data = { tasks: [], subscriptions: [] };
+    if (fs.existsSync(this.file)) {
+      this.data = { ...this.data, ...JSON.parse(fs.readFileSync(this.file, "utf8")) };
+    }
+    this.listeners = new Set();
+  }
+
+  save() {
+    // Write-then-rename so a crash never leaves a half-written file.
+    const tmp = `${this.file}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(this.data, null, 2));
+    fs.renameSync(tmp, this.file);
+    for (const fn of this.listeners) fn();
+  }
+
+  onChange(fn) {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+
+  // ---- tasks ----
+  listTasks() {
+    return this.data.tasks;
+  }
+
+  getTask(id) {
+    return this.data.tasks.find((t) => t.id === id) ?? null;
+  }
+
+  createTask(input) {
+    const task = {
+      id: newId(),
+      title: String(input.title ?? "").trim() || "Untitled task",
+      description: input.description ?? "",
+      instructions: input.instructions ?? "",
+      dueDate: input.dueDate || null,
+      priority: input.priority ?? "normal",
+      status: "todo",
+      activities: (input.activities ?? []).map((a) => makeActivity(a)),
+      log: [],
+      reminders: {},
+      createdAt: now(),
+      updatedAt: now(),
+    };
+    this.data.tasks.unshift(task);
+    this.addLog(task, "Task created");
+    this.save();
+    return task;
+  }
+
+  updateTask(id, patch) {
+    const task = this.getTask(id);
+    if (!task) return null;
+    const allowed = ["title", "description", "instructions", "dueDate", "priority", "status"];
+    for (const key of allowed) if (key in patch) task[key] = patch[key];
+    if ("dueDate" in patch) task.reminders = {}; // new date, new reminders
+    if (Array.isArray(patch.activities)) {
+      task.activities = patch.activities.map((a) => {
+        const existing = task.activities.find((x) => x.id === a.id);
+        return existing ? Object.assign(existing, pickActivityFields(a)) : makeActivity(a);
+      });
+    }
+    task.updatedAt = now();
+    this.save();
+    return task;
+  }
+
+  deleteTask(id) {
+    const before = this.data.tasks.length;
+    this.data.tasks = this.data.tasks.filter((t) => t.id !== id);
+    if (this.data.tasks.length !== before) this.save();
+    return this.data.tasks.length !== before;
+  }
+
+  addLog(task, message, level = "info") {
+    task.log.push({ at: now(), level, message });
+    if (task.log.length > 500) task.log.splice(0, task.log.length - 500);
+    task.updatedAt = now();
+  }
+
+  // ---- push subscriptions ----
+  addSubscription(sub) {
+    if (!this.data.subscriptions.some((s) => s.endpoint === sub.endpoint)) {
+      this.data.subscriptions.push(sub);
+      this.save();
+    }
+  }
+
+  removeSubscription(endpoint) {
+    this.data.subscriptions = this.data.subscriptions.filter((s) => s.endpoint !== endpoint);
+    this.save();
+  }
+}
+
+function pickActivityFields(a) {
+  const out = {};
+  for (const key of ["title", "instructions", "executor", "dueDate", "status", "needsApproval", "result"]) {
+    if (key in a) out[key] = a[key];
+  }
+  return out;
+}
+
+export function makeActivity(a = {}) {
+  return {
+    id: a.id ?? newId(),
+    title: String(a.title ?? "").trim() || "Untitled step",
+    instructions: a.instructions ?? "",
+    // "agent" = Claude does it; "human" = you do it and tick it off.
+    executor: a.executor === "human" ? "human" : "agent",
+    // When true the agent stops and asks before running this particular step,
+    // even after the overall plan was approved (payments, sending messages...).
+    needsApproval: Boolean(a.needsApproval),
+    dueDate: a.dueDate || null,
+    status: a.status ?? "todo",
+    result: a.result ?? "",
+    // Agent conversation state, so a step can pause for your answer and resume.
+    agent: null,
+  };
+}
