@@ -74,6 +74,7 @@ export class Runner {
       task.status = "todo";
       this.store.addLog(task, `Planning failed: ${err.message}`, "error");
       this.store.save();
+      await this.notifier.send({ title: `Planning failed: ${task.title}`, body: err.message, taskId: task.id });
       throw err;
     }
   }
@@ -83,6 +84,9 @@ export class Runner {
   approve(taskId) {
     const task = this.#mustGet(taskId);
     if (task.activities.length === 0) throw new Error("Add at least one activity before approving.");
+    if (task.private && task.activities.some((a) => a.executor === "agent" && a.status !== "done" && a.status !== "skipped")) {
+      throw new Error("Private tasks are never sent to Claude. Make every step a “Me” step, or turn off Private.");
+    }
     task.status = "queued";
     task.approvedAt = new Date().toISOString();
     this.store.addLog(task, "Plan approved. Starting work.");
@@ -154,6 +158,16 @@ export class Runner {
     if (!answerQuestion(activity, text)) throw new Error("That step is not waiting for an answer.");
     activity.status = "todo";
     this.store.addLog(task, `You answered: ${text}`);
+    this.#resumeOrFinish(task);
+    return task;
+  }
+
+  async resolveAction(taskId, activityId, approved) {
+    const { task, activity } = this.#mustGetActivity(taskId, activityId);
+    if (activity.agent?.pending?.kind !== "action") throw new Error("That step is not waiting for an approval.");
+    this.store.addLog(task, `${approved ? "Allowed" : "Declined"}: ${activity.agent.pending.question.split("\n")[0]}`);
+    await this.agent.resolveAction(task, activity, approved);
+    activity.status = "todo";
     this.#resumeOrFinish(task);
     return task;
   }
@@ -230,7 +244,7 @@ export class Runner {
         return;
       }
 
-      if (activity.agent?.pendingQuestion) {
+      if (activity.agent?.pending) {
         task.status = "waiting_on_you";
         activity.status = "waiting_on_you";
         this.store.save();
@@ -261,6 +275,10 @@ export class Runner {
       }
       if (result.outcome === "question") {
         await this.#waitOnUser(task, activity, `Question: ${task.title}`, result.text);
+        return;
+      }
+      if (result.outcome === "action") {
+        await this.#waitOnUser(task, activity, `Allow action? ${task.title}`, result.text);
         return;
       }
       activity.status = "failed";
@@ -341,5 +359,5 @@ function summarize(task) {
 
 // Once a step is done we only need its result, not the whole transcript.
 function compactTranscript(state) {
-  return state ? { turns: state.turns, messages: [], pendingQuestion: null } : null;
+  return state ? { turns: state.turns, messages: [], pending: null } : null;
 }

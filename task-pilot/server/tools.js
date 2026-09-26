@@ -2,8 +2,10 @@
 //
 // The agent can only act through the tools listed here, so this file is the
 // place to widen (or narrow) what "autonomous" means for you. To add a
-// capability, add an entry to `customTools` with a JSON schema and a `run`
-// function; the model sees `name`, `description` and `input_schema`.
+// capability, add an entry in `buildCustomTools` with a JSON schema and a
+// `run` function; the model sees `name`, `description` and `input_schema`.
+// Set `needsApproval: true` on anything with side effects so each call waits
+// for your OK on the phone.
 
 /** Control tools: these change the flow of the run rather than doing work. */
 export const CONTROL_TOOLS = {
@@ -73,6 +75,9 @@ export function buildCustomTools(ctx) {
   if (names.length > 0) {
     tools.push({
       name: "call_webhook",
+      // You approve each call on your phone (payload shown) unless you turn
+      // this off with WEBHOOKS_REQUIRE_APPROVAL=false.
+      needsApproval: ctx.config.webhooksRequireApproval !== false,
       description:
         "Trigger one of the user's pre-configured automations by name with a JSON payload. Available: " +
         names.map((n) => `"${n}"`).join(", ") +
@@ -108,8 +113,16 @@ export function buildCustomTools(ctx) {
 /** Anthropic-hosted tools: they run on Anthropic's side, no code needed here. */
 export function serverTools(config) {
   if (!config.enableWebTools) return [];
+  // Optionally confine browsing to (or away from) specific sites. The API
+  // accepts one list or the other, not both.
+  const scope = config.webAllowedDomains?.length
+    ? { allowed_domains: config.webAllowedDomains }
+    : config.webBlockedDomains?.length
+      ? { blocked_domains: config.webBlockedDomains }
+      : {};
   return [
-    { type: "web_search_20260209", name: "web_search", max_uses: 10 },
-    { type: "web_fetch_20260209", name: "web_fetch", max_uses: 10 },
+    { type: "web_search_20260209", name: "web_search", max_uses: 10, ...scope },
+    // web_fetch can only open URLs that already appear in the conversation.
+    { type: "web_fetch_20260209", name: "web_fetch", max_uses: 10, max_content_tokens: 50_000, ...scope },
   ];
 }

@@ -53,9 +53,10 @@ export class Agent {
    * @param {object} opts.config  see config.js
    * @param {Anthropic} [opts.client]  injectable for tests
    */
-  constructor({ config, client, notifier, fetchImpl = fetch }) {
+  constructor({ config, client, notifier, meter = null, fetchImpl = fetch }) {
     this.config = config;
     this.notifier = notifier;
+    this.meter = meter;
     this.fetch = fetchImpl;
     this.client = client ?? (config.agentEnabled ? new Anthropic() : null);
   }
@@ -64,8 +65,9 @@ export class Agent {
     return Boolean(this.client);
   }
 
-  async #call(params) {
-    return this.client.beta.messages.create({
+  async #call(task, params) {
+    this.meter?.check(task); // throws BudgetExceededError before spending more
+    const response = await this.client.beta.messages.create({
       model: this.config.model,
       max_tokens: 16000,
       thinking: { type: "adaptive" },
@@ -75,13 +77,25 @@ export class Agent {
       fallbacks: "default",
       ...omit(params, ["output_config"]),
     });
+    // A fallback may have served the request; bill at the model that answered.
+    this.meter?.record(task, response.model ?? this.config.model, response.usage);
+    return response;
+  }
+
+  #tools(task) {
+    const custom = buildCustomTools({ task, notifier: this.notifier, config: this.config, fetch: this.fetch });
+    return {
+      definitions: [...Object.values(CONTROL_TOOLS), ...custom.map(({ run, needsApproval, ...def }) => def), ...serverTools(this.config)],
+      byName: Object.fromEntries(custom.map((t) => [t.name, t])),
+    };
   }
 
   /** Returns {summary, activities[]} for the user to review. */
   async plan(task) {
+    assertShareable(task);
     if (!this.enabled) return fallbackPlan(task);
     const hooks = Object.keys(this.config.webhooks);
-    const response = await this.#call({
+    const response = await this.#call(task, {
       system: PLANNER_SYSTEM + (hooks.length ? `\n\nConfigured automations: ${hooks.join(", ")}.` : ""),
       output_config: { format: { type: "json_schema", schema: PLAN_SCHEMA } },
       messages: [{ role: "user", content: describeTask(task, { includePlan: false }) }],
@@ -99,25 +113,19 @@ export class Agent {
   /**
    * Work on one activity until it completes, fails, or needs the user.
    * Conversation state lives on `activity.agent` so a paused step resumes
-   * exactly where it stopped once the user answers.
+   * exactly where it stopped once the user answers or approves an action.
    *
    * @param {{task: object, activity: object, persist: () => void, shouldStop: () => boolean}} args
-   * @returns {Promise<{outcome: "done"|"failed"|"question"|"stopped", text: string}>}
+   * @returns {Promise<{outcome: "done"|"failed"|"question"|"action"|"stopped", text: string}>}
    */
   async runActivity({ task, activity, persist, shouldStop }) {
+    assertShareable(task);
     if (!this.enabled) {
       return { outcome: "failed", text: "No ANTHROPIC_API_KEY configured, so the agent cannot run steps. Mark it done yourself or add a key." };
     }
 
-    const custom = buildCustomTools({ task, notifier: this.notifier, config: this.config, fetch: this.fetch });
-    const tools = [
-      ...Object.values(CONTROL_TOOLS),
-      ...custom.map(({ run, ...def }) => def),
-      ...serverTools(this.config),
-    ];
-    const runners = Object.fromEntries(custom.map((t) => [t.name, t.run]));
-
-    const state = (activity.agent ??= { messages: [], turns: 0, pendingQuestion: null });
+    const { definitions, byName } = this.#tools(task);
+    const state = (activity.agent ??= { messages: [], turns: 0, pending: null });
     if (state.messages.length === 0) {
       state.messages.push({ role: "user", content: describeTask(task, { includePlan: true, current: activity }) });
     }
@@ -125,7 +133,7 @@ export class Agent {
     while (state.turns < MAX_TURNS_PER_STEP) {
       if (shouldStop()) return { outcome: "stopped", text: "Stopped by user." };
       state.turns++;
-      const response = await this.#call({ system: EXECUTOR_SYSTEM, tools, messages: state.messages });
+      const response = await this.#call(task, { system: EXECUTOR_SYSTEM, tools: definitions, messages: state.messages });
 
       if (response.stop_reason === "refusal") {
         return { outcome: "failed", text: "Claude declined to carry out this step." };
@@ -146,9 +154,12 @@ export class Agent {
 
       const results = [];
       let finish = null;
-      let question = null;
+      let pending = null; // at most one pause (question or action to approve) per turn
+      const onePause = (call) => results.push(toolResult(call, "Only one question or approval request per turn. Ask again after this one is resolved.", true));
+
       for (const call of calls) {
         const input = call.input ?? {};
+        const tool = byName[call.name];
         if (call.name === "complete_step") {
           finish = { outcome: "done", text: String(input.summary ?? said) };
           results.push(toolResult(call, "Recorded."));
@@ -156,10 +167,15 @@ export class Agent {
           finish = { outcome: "failed", text: String(input.reason ?? "Agent could not complete the step.") };
           results.push(toolResult(call, "Recorded."));
         } else if (call.name === "ask_user") {
-          question = { toolUseId: call.id, question: String(input.question ?? "") };
-        } else if (runners[call.name]) {
+          if (pending) onePause(call);
+          else pending = { kind: "question", toolUseId: call.id, question: String(input.question ?? "") };
+        } else if (tool?.needsApproval) {
+          // Side-effecting tools never run on the model's say-so alone.
+          if (pending) onePause(call);
+          else pending = { kind: "action", toolUseId: call.id, tool: call.name, input, question: describeAction(call.name, input) };
+        } else if (tool) {
           try {
-            results.push(toolResult(call, await runners[call.name](input)));
+            results.push(toolResult(call, await tool.run(input)));
           } catch (err) {
             results.push(toolResult(call, `Error: ${err.message}`, true));
           }
@@ -169,29 +185,61 @@ export class Agent {
       }
 
       if (finish) return finish;
-      if (question) {
-        // Hold the other results; they go back together with the answer.
-        state.pendingQuestion = { ...question, otherResults: results };
+      if (pending) {
+        // Hold the other results; they go back together with the user's reply.
+        state.pending = { ...pending, otherResults: results };
         persist();
-        return { outcome: "question", text: question.question };
+        return { outcome: pending.kind, text: pending.question };
       }
       state.messages.push({ role: "user", content: results });
       persist();
     }
     return { outcome: "failed", text: `Gave up after ${MAX_TURNS_PER_STEP} turns without finishing.` };
   }
+
+  /** Run (or refuse) an action the agent asked permission for, then let it continue. */
+  async resolveAction(task, activity, approved) {
+    const state = activity.agent;
+    if (state?.pending?.kind !== "action") return false;
+    const { toolUseId, tool, input, otherResults } = state.pending;
+    let result;
+    if (!approved) {
+      result = toolResult({ id: toolUseId }, "The user declined this action. Do not retry it; continue without it or explain what they should do.", true);
+    } else {
+      try {
+        result = toolResult({ id: toolUseId }, await this.#tools(task).byName[tool].run(input));
+      } catch (err) {
+        result = toolResult({ id: toolUseId }, `Error: ${err.message}`, true);
+      }
+    }
+    state.messages.push({ role: "user", content: [...otherResults, result] });
+    state.pending = null;
+    return true;
+  }
+}
+
+function describeAction(name, input) {
+  const payload = JSON.stringify(input.payload ?? {}, null, 2);
+  return name === "call_webhook"
+    ? `Allow the assistant to trigger automation "${input.name}" with:\n${payload}`
+    : `Allow the assistant to run ${name} with:\n${JSON.stringify(input, null, 2)}`;
+}
+
+/** Private tasks never leave your server. */
+export function assertShareable(task) {
+  if (task.private) throw new Error("This task is marked private, so it is never sent to Claude.");
 }
 
 /** Feed the user's answer back into a paused step. */
 export function answerQuestion(activity, answer) {
   const state = activity.agent;
-  if (!state?.pendingQuestion) return false;
-  const { toolUseId, otherResults } = state.pendingQuestion;
+  if (state?.pending?.kind !== "question") return false;
+  const { toolUseId, otherResults } = state.pending;
   state.messages.push({
     role: "user",
     content: [...otherResults, { type: "tool_result", tool_use_id: toolUseId, content: `User answered: ${answer}` }],
   });
-  state.pendingQuestion = null;
+  state.pending = null;
   return true;
 }
 

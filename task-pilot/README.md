@@ -87,18 +87,57 @@ Then on the phone:
 
 If you don't want to deal with HTTPS or web-push quirks, set `NTFY_TOPIC=some-long-random-name`. Then install the free **ntfy** app (iOS/Android) and subscribe to that topic. Every alert goes there as well. Anyone who knows a topic name on the public ntfy.sh server can read it, so pick one that's hard to guess, or run your own ntfy server.
 
-## Safety model
-
-- Nothing runs until you approve the plan. Steps marked **asks first** need a second OK.
-- The assistant acts only through the tools listed above. For webhooks, it can only call the names you configure.
-- **Stop** halts a task between assistant actions.
-- Every API call needs the app token. Treat it like a password.
-- Web content is treated as information, not as instructions to follow (this is in the system prompt).
-- Each step is capped at 30 model turns.
-
 ## Cost
 
-Each planning call is one Claude request. Each assistant step is usually a few requests, plus any web searches. The default model is `claude-opus-5` at effort `high`. For routine errands you can set `CLAUDE_EFFORT=medium` or `low` to spend less. You can switch model with `CLAUDE_MODEL`.
+| Item | Cost |
+| --- | --- |
+| The app itself, web push, ntfy.sh, Tailscale personal plan | Free |
+| Running it on your own computer | Free (just electricity; the computer must stay on) |
+| Small cloud host instead (Render / Railway / Fly.io / VPS) | About $0–7 per month, depending on the provider |
+| **Claude API**: pay per use, billed separately from a Claude.ai subscription | See below |
+
+Claude `claude-opus-5` costs $5 per million input tokens and $25 per million output tokens, and web searches cost $10 per 1,000. These are rough per-action estimates:
+
+- drafting a plan: about **$0.03–0.10**
+- a research step with a few searches: about **$0.20–0.60**
+- a typical 4-step errand: about **$0.50–1.50**
+
+Plain to-do use (no assistant) costs nothing.
+
+**Built-in brakes:**
+- `MONTHLY_BUDGET_USD` (default **$10**) and `TASK_BUDGET_USD` (default **$2**) stop the assistant once estimated spend reaches the cap.
+- Settings shows this month's spend, and each task shows its own cost.
+- Also set a spend limit in the Anthropic Console. That is the hard guarantee, because this app's figures are estimates.
+
+**To lower cost:** set `CLAUDE_EFFORT=medium` or `low`, or `ENABLE_WEB_TOOLS=false` if you don't need browsing. Stopping a task stops its spending. You can switch model with `CLAUDE_MODEL`.
+
+## Security
+
+**From the internet**
+- **Not exposed by default.** The server listens on `127.0.0.1` only. Reach it through **Tailscale** (recommended: only your own devices can connect) or a tunnel. Don't port-forward it on your router.
+- **App token.** Every API call needs a 43-character random token (at least 20 characters if you set your own). The token is compared in constant time and only sent in a header, never in URLs or logs.
+- **Brute-force lockout.** After 10 wrong tokens from one IP in 15 minutes, that IP is blocked and your phone gets an alert. After 100 wrong tokens in total, all sign-ins pause until the window clears.
+- **Hardened web layer.**
+  - Strict Content-Security-Policy (only the app's own scripts run), no framing, `nosniff`, no referrer, and HSTS on HTTPS.
+  - All output is HTML-escaped.
+  - Input size and shape are validated, and the request body is limited to 200 KB.
+  - Errors don't include stack traces.
+- **Data at rest.** `data/` is readable only by the server's user (0700 directory, 0600 files). The Docker image runs as a non-root user. `npm audit` reports 0 known vulnerabilities.
+
+**Around Claude (what the assistant can and can't do)**
+- **Approval gates.** Nothing runs until you approve the plan. Steps marked **asks first** need a second OK. **Every automation (webhook) call shows you its exact payload and waits for you to tap Allow.**
+- **No open-ended powers.** The assistant can't run code, touch files, spend money, log in anywhere, or call any URL except the webhooks you name. Browsing goes through Anthropic's hosted web tools, which can only fetch URLs already present in the conversation. You can limit browsing to certain sites with `WEB_ALLOWED_DOMAINS`.
+- **Prompt injection.** A malicious web page might try to instruct the assistant. The system prompt tells it to treat web content as information, not instructions. Even if a page did take over, it could only reach you (questions, notifications) or ask you to Allow an action.
+- **Hard limits.** 30 turns per step, spend caps, and a **Stop** button that halts the task between actions.
+- **Your data and Anthropic.** A task's text is sent to Anthropic's API only when you plan or run it with the assistant. Anthropic's commercial terms say API data isn't used to train models by default; check their current privacy policy for retention details. Mark sensitive tasks **🔒 Private** and they are never sent to Claude. Never put passwords or card numbers in tasks.
+- **Alert privacy.** Notification text passes through Apple, Google, or ntfy. Set `ALERT_DETAILS=false` to send only "something needs you". If you use the public ntfy.sh server, choose a long random topic name, or protect it with `NTFY_TOKEN`.
+
+**What's still on you**
+- Keep the token secret. If your phone is lost, change `APP_TOKEN` (or delete `data/app-token.txt`) and restart.
+- Keep Node, the OS, and dependencies updated (`npm audit`).
+- Back up `data/`.
+
+No software can promise to be impossible to break into. This setup keeps the attack surface small, puts it behind your private network, and makes sure nothing with real-world effects happens without your tap.
 
 ## Project layout
 
@@ -110,6 +149,7 @@ server/
   agent.js    Claude: plan generation (structured output) + per-step tool loop
   tools.js    what the assistant is allowed to do
   notify.js   web push + ntfy
+  usage.js    spend estimates and budget caps
   db.js       JSON-file storage (data/db.json)
   config.js   env / .env loading
 public/       the phone app (vanilla JS PWA + service worker)

@@ -118,23 +118,45 @@ async function route() {
     if (page === "new") return renderForm(null);
     if (page === "task" && sub === "edit") return renderForm(await api(`/tasks/${id}`));
     if (page === "task") return await renderTask(id);
-    if (page === "settings") return renderSettings();
+    if (page === "settings") {
+      config = await api("/config"); // fresh spend figures
+      return renderSettings();
+    }
     location.hash = "#/";
   } catch (err) {
     $view.innerHTML = `<p class="empty">${esc(err.message)}</p><p style="text-align:center"><a href="#/">Back to tasks</a></p>`;
   }
 }
 
+// Live updates over Server-Sent Events. Read with fetch() rather than
+// EventSource so the token travels in a header, never in a URL or server log.
 let events;
 function startLiveUpdates() {
-  events?.close();
-  events = new EventSource(`/api/events?token=${encodeURIComponent(token)}`);
-  events.addEventListener("change", () => {
-    // Don't clobber a form the user is typing in.
-    if (/^#\/(new|task\/[^/]+\/edit|settings)/.test(location.hash)) return;
-    if (document.activeElement?.matches("textarea, input")) return;
-    route();
-  });
+  events?.abort();
+  const ctrl = (events = new AbortController());
+  (async function listen(delay) {
+    try {
+      const res = await fetch("/api/events", { headers: { authorization: `Bearer ${token}` }, signal: ctrl.signal });
+      if (!res.ok) return;
+      const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+      delay = 1000;
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value.includes("event: change")) onRemoteChange();
+      }
+    } catch {
+      if (ctrl.signal.aborted) return;
+    }
+    setTimeout(() => !ctrl.signal.aborted && listen(Math.min(delay * 2, 30000)), delay);
+  })(1000);
+}
+
+function onRemoteChange() {
+  // Don't clobber a form the user is typing in.
+  if (/^#\/(new|task\/[^/]+\/edit|settings)/.test(location.hash)) return;
+  if (document.activeElement?.matches("textarea, input")) return;
+  route();
 }
 
 // ------------------------------------------------------------------ login
@@ -217,8 +239,8 @@ async function renderTask(id) {
   const t = await api(`/tasks/${id}`);
   const s = t.status;
   const can = {
-    plan: config.agentEnabled && ["todo", "pending_approval", "failed", "cancelled"].includes(s),
-    approve: s === "pending_approval" || (s === "todo" && t.activities.some((a) => a.executor === "agent")),
+    plan: config.agentEnabled && !t.private && ["todo", "pending_approval", "failed", "cancelled"].includes(s),
+    approve: !t.private && (s === "pending_approval" || (s === "todo" && t.activities.some((a) => a.executor === "agent"))),
     cancel: ["pending_approval", "queued", "running", "waiting_on_you", "planning"].includes(s),
     retry: s === "failed" || s === "cancelled",
   };
@@ -235,6 +257,8 @@ async function renderTask(id) {
       ${chip(s)}
       ${t.dueDate ? `<span class="${isOverdue(t) ? "overdue" : ""}">⏰ ${esc(fmtDue(t.dueDate))}</span>` : ""}
       ${t.priority === "high" ? "<span>🔥 High priority</span>" : ""}
+      ${t.private ? "<span>🔒 Private: never sent to Claude</span>" : ""}
+      ${t.costUsd ? `<span>≈ $${t.costUsd.toFixed(2)} assistant cost</span>` : ""}
     </div>
     ${attention}
     <div class="actions">
@@ -275,7 +299,10 @@ function step(t, a, i) {
   const waiting = a.status === "waiting_on_you";
   const managed = !["todo", "done", "cancelled"].includes(t.status) || t.approvedAt;
   const buttons = [];
-  if (a.question && waiting) {
+  if (a.pendingKind === "action" && waiting) {
+    buttons.push(`<button class="btn small primary" data-step="allow" data-aid="${a.id}">✓ Allow</button>`);
+    buttons.push(`<button class="btn small danger" data-step="deny" data-aid="${a.id}">✕ Decline</button>`);
+  } else if (a.question && waiting) {
     // answer form rendered below
   } else if (waiting && a.executor === "agent" && a.needsApproval && !a.approvedAt) {
     buttons.push(`<button class="btn small primary" data-step="approve" data-aid="${a.id}">✓ Allow this step</button>`);
@@ -303,7 +330,12 @@ function step(t, a, i) {
         ${a.instructions ? `<p class="pre">${esc(a.instructions)}</p>` : ""}
         ${a.result ? `<div class="result pre">${esc(a.result)}</div>` : ""}
         ${
-          a.question && waiting
+          a.pendingKind === "action" && waiting
+            ? `<div class="question"><strong>The assistant wants to act:</strong><div class="pre">${esc(a.question)}</div></div>`
+            : ""
+        }
+        ${
+          a.pendingKind === "question" && waiting
             ? `<form class="answer question" data-aid="${a.id}">
                  <strong>Question:</strong> <span class="pre">${esc(a.question)}</span>
                  <label for="ans-${a.id}">Your answer</label>
@@ -331,6 +363,11 @@ async function taskAction(t, action) {
 }
 
 async function stepAction(t, aid, action) {
+  if (action === "allow" || action === "deny") {
+    await api(`/tasks/${t.id}/activities/${aid}/action`, { method: "POST", body: { approve: action === "allow" } });
+    toast(action === "allow" ? "Allowed. The assistant will continue." : "Declined.");
+    return route();
+  }
   let body;
   if (action === "complete") {
     const note = prompt("Add a note (optional):") ?? null;
@@ -378,6 +415,7 @@ function renderForm(t) {
       <div id="steps"></div>
       <button type="button" class="btn small" id="addstep">+ Add activity</button>
 
+      <label class="check"><input type="checkbox" id="f-private" ${t?.private ? "checked" : ""} /> 🔒 Private: never send this task to Claude</label>
       ${
         !editing && config.agentEnabled
           ? `<label class="check"><input type="checkbox" id="f-auto" checked /> Let Claude draft the plan (you approve before anything runs)</label>`
@@ -458,13 +496,14 @@ function renderForm(t) {
       description: document.getElementById("f-desc").value,
       instructions: document.getElementById("f-instr").value,
       activities: steps,
+      private: document.getElementById("f-private").checked,
     };
     run(e.submitter, async () => {
       if (editing) {
         await api(`/tasks/${t.id}`, { method: "PATCH", body });
         location.hash = `#/task/${t.id}`;
       } else {
-        body.autoPlan = document.getElementById("f-auto")?.checked ?? false;
+        body.autoPlan = !body.private && (document.getElementById("f-auto")?.checked ?? false);
         const created = await api("/tasks", { method: "POST", body });
         if (body.autoPlan) toast("Drafting a plan… you'll get a notification to approve it.");
         location.hash = `#/task/${created.id}`;
@@ -512,7 +551,8 @@ function renderSettings() {
       ${
         config.agentEnabled
           ? `<p>On · model <code>${esc(config.model)}</code></p>
-             <p class="hint">Tools: ask you questions, send you notifications${config.webTools ? ", search the web, read web pages" : ""}${config.webhooks.length ? `, trigger automations (${config.webhooks.map(esc).join(", ")})` : ""}.</p>`
+             ${usageLine()}
+             <p class="hint">Tools: ask you questions, send you notifications${config.webTools ? ", search the web, read web pages" : ""}${config.webhooks.length ? `, trigger automations (${config.webhooks.map(esc).join(", ")})${config.webhooksRequireApproval ? ", each one only after you tap Allow" : ""}` : ""}.</p>`
           : `<p>Off. Set <code>ANTHROPIC_API_KEY</code> on the server to enable planning and autonomous steps.</p>`
       }
     </div>
@@ -530,10 +570,18 @@ function renderSettings() {
     safeSet("token", null);
     token = null;
     config = null;
-    events?.close();
+    events?.abort();
     location.hash = "#/";
     route();
   };
+}
+
+function usageLine() {
+  const u = config.usage;
+  if (!u) return "";
+  const cap = u.monthlyBudgetUsd > 0 ? ` of $${u.monthlyBudgetUsd.toFixed(2)} monthly cap` : " (no monthly cap)";
+  const task = u.taskBudgetUsd > 0 ? ` · max $${u.taskBudgetUsd.toFixed(2)} per task` : "";
+  return `<p>This month: <strong>≈ $${u.usd.toFixed(2)}</strong>${cap}${task} · ${u.requests} requests</p>`;
 }
 
 async function enablePush() {

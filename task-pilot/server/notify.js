@@ -7,8 +7,10 @@ import path from "node:path";
 import webpush from "web-push";
 
 export class Notifier {
-  constructor({ store, dataDir, publicUrl, ntfyTopic, ntfyServer, vapidSubject, fetchImpl = fetch }) {
+  constructor({ store, dataDir, publicUrl, ntfyTopic, ntfyServer, ntfyToken, alertDetails = true, vapidSubject, fetchImpl = fetch }) {
     this.store = store;
+    this.alertDetails = alertDetails;
+    this.ntfyToken = ntfyToken;
     this.publicUrl = publicUrl;
     this.ntfyTopic = ntfyTopic;
     this.ntfyServer = (ntfyServer || "https://ntfy.sh").replace(/\/$/, "");
@@ -25,6 +27,10 @@ export class Notifier {
    * @param {{title: string, body: string, taskId?: string, urgent?: boolean, tag?: string}} msg
    */
   async send(msg) {
+    if (!this.alertDetails) {
+      // Keep task contents off Apple/Google push servers and ntfy.
+      msg = { ...msg, title: "Task Pilot", body: msg.urgent ? "Something needs your attention. Open the app." : "There's an update. Open the app." };
+    }
     const url = msg.taskId ? `${this.publicUrl || ""}/#/task/${msg.taskId}` : `${this.publicUrl || ""}/`;
     const jobs = [this.#sendWebPush({ ...msg, url })];
     if (this.ntfyTopic) jobs.push(this.#sendNtfy({ ...msg, url }));
@@ -48,6 +54,7 @@ export class Notifier {
     try {
       const headers = { Title: asciiHeader(msg.title), Priority: msg.urgent ? "high" : "default", Tags: "clipboard" };
       if (this.publicUrl) headers.Click = msg.url;
+      if (this.ntfyToken) headers.Authorization = `Bearer ${this.ntfyToken}`;
       const res = await this.fetch(`${this.ntfyServer}/${encodeURIComponent(this.ntfyTopic)}`, {
         method: "POST",
         headers,

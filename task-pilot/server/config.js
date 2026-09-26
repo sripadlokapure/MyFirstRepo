@@ -19,7 +19,14 @@ function loadDotEnv(file) {
 export function loadConfig(env = process.env) {
   loadDotEnv(path.join(root, ".env"));
   const dataDir = path.resolve(root, env.DATA_DIR || "data");
-  fs.mkdirSync(dataDir, { recursive: true });
+  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+
+  const appToken = env.APP_TOKEN || loadOrCreateToken(dataDir);
+  if (appToken.length < MIN_TOKEN_LENGTH) {
+    throw new Error(`APP_TOKEN must be at least ${MIN_TOKEN_LENGTH} characters. Leave it empty to have a strong one generated.`);
+  }
+  const list = (v) => (v || "").split(",").map((d) => d.trim()).filter(Boolean);
+  const money = (v, fallback) => (v === undefined || v === "" ? fallback : Math.max(0, Number(v) || 0));
 
   let webhooks = {};
   if (env.WEBHOOKS) {
@@ -34,23 +41,38 @@ export function loadConfig(env = process.env) {
     root,
     dataDir,
     port: Number(env.PORT || 3000),
+    // Localhost only by default: reach it through Tailscale/cloudflared, not an open port.
+    host: env.HOST || "127.0.0.1",
+    // Set when behind a reverse proxy so rate limiting sees real client IPs (e.g. "loopback" or 1).
+    trustProxy: env.TRUST_PROXY || false,
     publicUrl: (env.PUBLIC_URL || "").replace(/\/$/, ""),
-    appToken: env.APP_TOKEN || loadOrCreateToken(dataDir),
+    appToken,
     agentEnabled: Boolean(env.ANTHROPIC_API_KEY || env.ANTHROPIC_AUTH_TOKEN),
     model: env.CLAUDE_MODEL || "claude-opus-5",
     effort: env.CLAUDE_EFFORT || "high",
     enableWebTools: env.ENABLE_WEB_TOOLS !== "false",
+    webAllowedDomains: list(env.WEB_ALLOWED_DOMAINS),
+    webBlockedDomains: list(env.WEB_BLOCKED_DOMAINS),
     webhooks,
+    webhooksRequireApproval: env.WEBHOOKS_REQUIRE_APPROVAL !== "false",
+    // 0 means no cap. Estimates from list prices; also set a limit in the Anthropic Console.
+    monthlyBudgetUsd: money(env.MONTHLY_BUDGET_USD, 10),
+    taskBudgetUsd: money(env.TASK_BUDGET_USD, 2),
+    // false = alerts say only "a task needs you", no task details leave the server.
+    alertDetails: env.ALERT_DETAILS !== "false",
+    ntfyToken: env.NTFY_TOKEN || "",
     ntfyTopic: env.NTFY_TOPIC || "",
     ntfyServer: env.NTFY_SERVER || "https://ntfy.sh",
     vapidSubject: env.VAPID_SUBJECT || "",
   };
 }
 
+const MIN_TOKEN_LENGTH = 20;
+
 function loadOrCreateToken(dataDir) {
   const file = path.join(dataDir, "app-token.txt");
   if (fs.existsSync(file)) return fs.readFileSync(file, "utf8").trim();
-  const token = crypto.randomBytes(18).toString("base64url");
+  const token = crypto.randomBytes(32).toString("base64url");
   fs.writeFileSync(file, token, { mode: 0o600 });
   return token;
 }

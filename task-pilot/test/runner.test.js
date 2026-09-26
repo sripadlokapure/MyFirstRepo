@@ -64,7 +64,7 @@ test("plan -> approve -> question -> answer -> human step -> done", async () => 
   await runner.process(task.id);
   let t = store.getTask(task.id);
   assert.equal(t.status, "waiting_on_you");
-  assert.equal(t.activities[0].agent.pendingQuestion.question, "Budget?");
+  assert.equal(t.activities[0].agent.pending.question, "Budget?");
   assert.match(sent.at(-1).body, /Budget\?/);
 
   runner.answer(task.id, t.activities[0].id, "Under 5000");

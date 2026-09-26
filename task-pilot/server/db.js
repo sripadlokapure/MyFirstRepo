@@ -25,7 +25,7 @@ export class Store {
   constructor(dataDir) {
     this.dataDir = dataDir;
     this.file = path.join(dataDir, "db.json");
-    fs.mkdirSync(dataDir, { recursive: true });
+    fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
     this.data = { tasks: [], subscriptions: [] };
     if (fs.existsSync(this.file)) {
       this.data = { ...this.data, ...JSON.parse(fs.readFileSync(this.file, "utf8")) };
@@ -36,7 +36,7 @@ export class Store {
   save() {
     // Write-then-rename so a crash never leaves a half-written file.
     const tmp = `${this.file}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(this.data, null, 2));
+    fs.writeFileSync(tmp, JSON.stringify(this.data, null, 2), { mode: 0o600 });
     fs.renameSync(tmp, this.file);
     for (const fn of this.listeners) fn();
   }
@@ -56,6 +56,7 @@ export class Store {
   }
 
   createTask(input) {
+    validateTaskInput(input);
     const task = {
       id: newId(),
       title: String(input.title ?? "").trim() || "Untitled task",
@@ -63,6 +64,8 @@ export class Store {
       instructions: input.instructions ?? "",
       dueDate: input.dueDate || null,
       priority: input.priority ?? "normal",
+      // Private tasks are never sent to Claude; they stay a plain checklist.
+      private: Boolean(input.private),
       status: "todo",
       activities: (input.activities ?? []).map((a) => makeActivity(a)),
       log: [],
@@ -79,7 +82,8 @@ export class Store {
   updateTask(id, patch) {
     const task = this.getTask(id);
     if (!task) return null;
-    const allowed = ["title", "description", "instructions", "dueDate", "priority", "status"];
+    validateTaskInput(patch);
+    const allowed = ["title", "description", "instructions", "dueDate", "priority", "status", "private"];
     for (const key of allowed) if (key in patch) task[key] = patch[key];
     if ("dueDate" in patch) task.reminders = {}; // new date, new reminders
     if (Array.isArray(patch.activities)) {
@@ -120,6 +124,32 @@ export class Store {
   }
 }
 
+const LIMITS = { title: 200, description: 5000, instructions: 10000, activities: 50 };
+
+/** Reject oversized or malformed input instead of storing it (or sending it to Claude). */
+export function validateTaskInput(input) {
+  const fail = (msg) => {
+    throw Object.assign(new Error(msg), { status: 400 });
+  };
+  for (const key of ["title", "description", "instructions"]) {
+    if (input[key] != null && typeof input[key] !== "string") fail(`${key} must be text`);
+    if ((input[key]?.length ?? 0) > LIMITS[key]) fail(`${key} is longer than ${LIMITS[key]} characters`);
+  }
+  if (input.dueDate != null && input.dueDate !== "" && Number.isNaN(Date.parse(input.dueDate))) fail("dueDate is not a valid date");
+  if (input.priority != null && !["low", "normal", "high"].includes(input.priority)) fail("priority must be low, normal or high");
+  if (input.activities != null) {
+    if (!Array.isArray(input.activities)) fail("activities must be a list");
+    if (input.activities.length > LIMITS.activities) fail(`At most ${LIMITS.activities} activities`);
+    for (const a of input.activities) {
+      if (typeof a !== "object" || a === null) fail("Each activity must be an object");
+      if (String(a.title ?? "").length > LIMITS.title) fail("Activity title is too long");
+      if (String(a.instructions ?? "").length > LIMITS.instructions) fail("Activity instructions are too long");
+      if (a.dueDate && Number.isNaN(Date.parse(a.dueDate))) fail("Activity dueDate is not a valid date");
+      if (a.status != null && !ACTIVITY_STATUSES.includes(a.status)) fail("Unknown activity status");
+    }
+  }
+}
+
 function pickActivityFields(a) {
   const out = {};
   for (const key of ["title", "instructions", "executor", "dueDate", "status", "needsApproval", "result"]) {
@@ -132,7 +162,7 @@ export function makeActivity(a = {}) {
   return {
     id: a.id ?? newId(),
     title: String(a.title ?? "").trim() || "Untitled step",
-    instructions: a.instructions ?? "",
+    instructions: String(a.instructions ?? ""),
     // "agent" = Claude does it; "human" = you do it and tick it off.
     executor: a.executor === "human" ? "human" : "agent",
     // When true the agent stops and asks before running this particular step,
