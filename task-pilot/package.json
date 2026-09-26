@@ -1,0 +1,21 @@
+{
+  "name": "task-pilot",
+  "version": "0.1.0",
+  "description": "To-do list with activities, due dates and a Claude agent that completes tasks after your approval. Installable on your phone (PWA) with push alerts.",
+  "type": "module",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.128.0",
+    "express": "^5.2.1",
+    "web-push": "^3.6.7"
+  }
+}
