@@ -55,6 +55,10 @@ To give the assistant more abilities, add a tool to `buildCustomTools()` in `ser
 
 ## Run it
 
+**Step-by-step desktop install for Windows and Mac, with no coding needed: see [INSTALL.md](INSTALL.md).** It uses the double-click start scripts `start-windows.bat` and `start-mac.command`.
+
+For developers:
+
 Requires Node 20+.
 
 ```bash
