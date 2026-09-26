@@ -6,13 +6,19 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 // Minimal .env loader so there's no extra dependency. Real env vars win.
+// Within the file, the last non-empty value for a key wins (so adding a line
+// at the bottom works even if the example left an empty one above).
 function loadDotEnv(file) {
   if (!fs.existsSync(file)) return;
-  for (const line of fs.readFileSync(file, "utf8").split("\n")) {
-    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/);
+  const values = {};
+  for (const line of fs.readFileSync(file, "utf8").replace(/^\uFEFF/, "").split(/\r?\n/)) {
+    const m = line.match(/^\s*([A-Z0-9_]+)\s*=(.*)$/);
     if (!m || line.trim().startsWith("#")) continue;
-    const value = m[2].replace(/^(['"])(.*)\1$/, "$2");
-    if (!(m[1] in process.env)) process.env[m[1]] = value;
+    const value = m[2].trim().replace(/^(['"])(.*)\1$/, "$2");
+    if (value !== "" || !(m[1] in values)) values[m[1]] = value;
+  }
+  for (const [key, value] of Object.entries(values)) {
+    if (!(key in process.env)) process.env[key] = value;
   }
 }
 
